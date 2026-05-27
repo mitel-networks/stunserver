@@ -1,0 +1,14 @@
+[Unit]
+Description=STUN Server (RFC 5389/8489)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/stunserver
+User=stunserver
+Group=stunserver
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
