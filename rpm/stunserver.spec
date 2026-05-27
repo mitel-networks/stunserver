@@ -5,6 +5,8 @@ Summary:        STUN server and client compliant with RFC 5389/8489
 License:        Apache-2.0
 URL:            https://github.com/jselbie/stunserver
 
+%global debug_package %{nil}
+
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc-c++
