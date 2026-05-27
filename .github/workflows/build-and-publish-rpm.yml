@@ -1,0 +1,62 @@
+name: Build and Publish RPM
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-rpm:
+    name: Build RPM (Amazon Linux 2023)
+    runs-on: ubuntu-latest
+    container:
+      image: amazonlinux:2023
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            curl \
+            git \
+            gcc-c++ \
+            make \
+            openssl-devel \
+            boost-devel \
+            rpm-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare rpmbuild tree
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p "$HOME/rpmbuild/"{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp -a "$GITHUB_WORKSPACE" "/tmp/stunserver-${VERSION}"
+          tar czf "$HOME/rpmbuild/SOURCES/stunserver-${VERSION}.tar.gz" \
+            -C /tmp "stunserver-${VERSION}"
+          cp rpm/stunserver.spec "$HOME/rpmbuild/SPECS/"
+
+      - name: Build RPM
+        id: build_rpm
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          rpmbuild -bb \
+            --define "pkg_version ${VERSION}" \
+            --define "_topdir $HOME/rpmbuild" \
+            "$HOME/rpmbuild/SPECS/stunserver.spec"
+          RPM_FILE=$(find "$HOME/rpmbuild/RPMS" -name "stunserver-*.rpm" | head -1)
+          echo "rpm_file=${RPM_FILE}" >> "$GITHUB_OUTPUT"
+          echo "rpm_name=$(basename "${RPM_FILE}")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload RPM to Artifactory
+        run: |
+          curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.ARTIFACTORYTOKEN }}" \
+            -T "${{ steps.build_rpm.outputs.rpm_file }}" \
+            "https://artifactory.mitel.com/artifactory/stunserver-rpm-internal/${{ steps.build_rpm.outputs.rpm_name }}"
