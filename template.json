@@ -291,7 +291,7 @@
                 "cat > /etc/systemd/system/stunserver.service.d/override.conf << EOF",
                 "[Service]",
                 "ExecStart=",
-                "ExecStart=/usr/bin/stunserver --mode full --primaryinterface eth0 --altinterface eth1 --primaryadvertised ${PRIMARY_EIP} --altadvertised ${ALT_EIP} --protocol udp",
+                "ExecStart=/usr/bin/stunserver --mode full --primaryinterface eth0 --altinterface eth1 --primaryadvertised ${PRIMARY_EIP} --altadvertised ${ALT_EIP} --protocol udp --allow-response-address-unsafe",
                 "EOF",
                 "",
                 "# ── Start service ─────────────────────────────────────────",
