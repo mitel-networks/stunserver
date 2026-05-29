@@ -1,0 +1,361 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Deploys a STUN server (full mode, RFC 5389/8489) on EC2 with two network interfaces each backed by an Elastic IP. An Auto Scaling Group of size 1 provides self-healing. Latency-based Route 53 routing sends clients to the nearest regional deployment.",
+
+  "Parameters": {
+    "HostedZoneId": {
+      "Type": "String",
+      "Description": "Route 53 hosted zone ID for stunc.mitel.io — create this zone manually before deploying the stack."
+    }
+  },
+
+  "Mappings": {
+    "RegionMap": {
+      "us-east-1": {
+        "AmiId": "PLACEHOLDER_AMI_ID",
+        "KeyName": "PLACEHOLDER_KEY_NAME"
+      },
+      "eu-central-1": {
+        "AmiId": "PLACEHOLDER_AMI_ID",
+        "KeyName": "PLACEHOLDER_KEY_NAME"
+      }
+    }
+  },
+
+  "Resources": {
+
+    "StunVPC": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.0.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-vpc-${AWS::Region}" } }]
+      }
+    },
+
+    "StunSubnet": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": { "Ref": "StunVPC" },
+        "CidrBlock": "10.0.1.0/24",
+        "AvailabilityZone": { "Fn::Select": [ 0, { "Fn::GetAZs": "" } ] },
+        "MapPublicIpOnLaunch": false,
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-subnet-${AWS::Region}" } }]
+      }
+    },
+
+    "StunInternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-igw-${AWS::Region}" } }]
+      }
+    },
+
+    "StunVPCGatewayAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": { "Ref": "StunVPC" },
+        "InternetGatewayId": { "Ref": "StunInternetGateway" }
+      }
+    },
+
+    "StunRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": { "Ref": "StunVPC" },
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-rt-${AWS::Region}" } }]
+      }
+    },
+
+    "StunRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "StunVPCGatewayAttachment",
+      "Properties": {
+        "RouteTableId": { "Ref": "StunRouteTable" },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": { "Ref": "StunInternetGateway" }
+      }
+    },
+
+    "StunSubnetRouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": { "Ref": "StunSubnet" },
+        "RouteTableId": { "Ref": "StunRouteTable" }
+      }
+    },
+
+    "StunSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "STUN server: UDP 3478/3479 inbound, SSH inbound",
+        "VpcId": { "Ref": "StunVPC" },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "udp",
+            "FromPort": 3478,
+            "ToPort": 3478,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "STUN primary port UDP"
+          },
+          {
+            "IpProtocol": "udp",
+            "FromPort": 3479,
+            "ToPort": 3479,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "STUN alternate port UDP"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "SSH"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Allow all outbound"
+          }
+        ],
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-sg-${AWS::Region}" } }]
+      }
+    },
+
+    "StunRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": { "Fn::Sub": "stunserver-role-${AWS::Region}" },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "ec2.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "StunServerPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "GetArtifactorySecret",
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": { "Fn::Sub": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:artifactory/stunserver*" }
+                },
+                {
+                  "Sid": "AssociateEIPs",
+                  "Effect": "Allow",
+                  "Action": "ec2:AssociateAddress",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "DescribeENIs",
+                  "Effect": "Allow",
+                  "Action": "ec2:DescribeNetworkInterfaces",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "StunInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "InstanceProfileName": { "Fn::Sub": "stunserver-profile-${AWS::Region}" },
+        "Roles": [ { "Ref": "StunRole" } ]
+      }
+    },
+
+    "EIP1": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc",
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-eip1-${AWS::Region}" } }]
+      }
+    },
+
+    "EIP2": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc",
+        "Tags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-eip2-${AWS::Region}" } }]
+      }
+    },
+
+    "StunLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": { "Fn::Sub": "stunserver-lt-${AWS::Region}" },
+        "LaunchTemplateData": {
+          "InstanceType": "t3.small",
+          "ImageId": { "Fn::FindInMap": [ "RegionMap", { "Ref": "AWS::Region" }, "AmiId" ] },
+          "KeyName": { "Fn::FindInMap": [ "RegionMap", { "Ref": "AWS::Region" }, "KeyName" ] },
+          "IamInstanceProfile": { "Name": { "Ref": "StunInstanceProfile" } },
+          "NetworkInterfaces": [
+            {
+              "DeviceIndex": 0,
+              "SubnetId": { "Ref": "StunSubnet" },
+              "Groups": [ { "Ref": "StunSecurityGroup" } ],
+              "DeleteOnTermination": true
+            },
+            {
+              "DeviceIndex": 1,
+              "SubnetId": { "Ref": "StunSubnet" },
+              "Groups": [ { "Ref": "StunSecurityGroup" } ],
+              "DeleteOnTermination": true
+            }
+          ],
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Join": ["\n", [
+                "#!/bin/bash",
+                "set -ex",
+                "",
+                "# ── IMDSv2 token ──────────────────────────────────────────",
+                "TOKEN=$(curl -sXPUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')",
+                "IMDS='http://169.254.169.254/latest/meta-data'",
+                "",
+                "# ── Install dependencies ──────────────────────────────────",
+                "dnf install -y awscli jq",
+                "",
+                "# ── Retrieve Artifactory credentials from Secrets Manager ─",
+                { "Fn::Sub": "SECRET=$(aws secretsmanager get-secret-value --secret-id artifactory/stunserver --region ${AWS::Region} --query SecretString --output text)" },
+                "ARTIFACTORY_USER=$(echo \"$SECRET\" | jq -r '.username')",
+                "ARTIFACTORY_TOKEN=$(echo \"$SECRET\" | jq -r '.token')",
+                "",
+                "# ── Configure Artifactory yum repo ────────────────────────",
+                "cat > /etc/yum.repos.d/artifactory-stunserver.repo << REPO",
+                "[stunserver-rpm-internal]",
+                "name=Stunserver RPM Internal",
+                "baseurl=https://${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}@artifactory.mitel.com/artifactory/stunserver-rpm-internal/",
+                "enabled=1",
+                "gpgcheck=0",
+                "REPO",
+                "",
+                "# ── Install stunserver (masked to prevent RPM %post auto-start) ─",
+                "systemctl mask stunserver.service",
+                "dnf install -y stunserver",
+                "systemctl unmask stunserver.service",
+                "",
+                "# ── Resolve ENI IDs for DeviceIndex 0 and 1 ─────────────",
+                "ENI0_ID=''",
+                "ENI1_ID=''",
+                "for MAC in $(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/\"); do",
+                "  MAC=$(echo \"$MAC\" | tr -d '/')",
+                "  DEV=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/device-number\")",
+                "  ENI=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/interface-id\")",
+                "  if [ \"$DEV\" = '0' ]; then ENI0_ID=$ENI; fi",
+                "  if [ \"$DEV\" = '1' ]; then ENI1_ID=$ENI; fi",
+                "done",
+                "",
+                "# ── Associate Elastic IPs ─────────────────────────────────",
+                { "Fn::Sub": "aws ec2 associate-address --allocation-id ${EIP1.AllocationId} --network-interface-id \"$ENI0_ID\" --allow-reassociation --region ${AWS::Region}" },
+                { "Fn::Sub": "aws ec2 associate-address --allocation-id ${EIP2.AllocationId} --network-interface-id \"$ENI1_ID\" --allow-reassociation --region ${AWS::Region}" },
+                "",
+                "# ── Wait for both ENIs to have public IPs (max 5 min) ────",
+                "PRIMARY_EIP=''",
+                "ALT_EIP=''",
+                "for i in $(seq 1 30); do",
+                "  PRIMARY_EIP=''",
+                "  ALT_EIP=''",
+                "  for MAC in $(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/\"); do",
+                "    MAC=$(echo \"$MAC\" | tr -d '/')",
+                "    DEV=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/device-number\")",
+                "    PUB=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/public-ipv4s\" 2>/dev/null || true)",
+                "    if [ \"$DEV\" = '0' ]; then PRIMARY_EIP=$PUB; fi",
+                "    if [ \"$DEV\" = '1' ]; then ALT_EIP=$PUB; fi",
+                "  done",
+                "  if [ -n \"$PRIMARY_EIP\" ] && [ -n \"$ALT_EIP\" ]; then break; fi",
+                "  sleep 10",
+                "done",
+                "",
+                "if [ -z \"$PRIMARY_EIP\" ] || [ -z \"$ALT_EIP\" ]; then",
+                "  echo 'ERROR: Timed out waiting for EIP association' >&2",
+                "  exit 1",
+                "fi",
+                "",
+                "# ── Write systemd drop-in with literal EIP values ────────",
+                "mkdir -p /etc/systemd/system/stunserver.service.d",
+                "cat > /etc/systemd/system/stunserver.service.d/override.conf << EOF",
+                "[Service]",
+                "ExecStart=",
+                "ExecStart=/usr/bin/stunserver --mode full --primaryinterface eth0 --altinterface eth1 --primaryadvertised ${PRIMARY_EIP} --altadvertised ${ALT_EIP} --protocol udp",
+                "EOF",
+                "",
+                "# ── Start service ─────────────────────────────────────────",
+                "systemctl daemon-reload",
+                "systemctl enable stunserver.service",
+                "systemctl start stunserver.service"
+              ]]
+            }
+          }
+        }
+      }
+    },
+
+    "StunASG": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "DependsOn": "StunVPCGatewayAttachment",
+      "Properties": {
+        "AutoScalingGroupName": { "Fn::Sub": "stunserver-asg-${AWS::Region}" },
+        "MinSize": "1",
+        "MaxSize": "1",
+        "DesiredCapacity": "1",
+        "VPCZoneIdentifier": [ { "Ref": "StunSubnet" } ],
+        "LaunchTemplate": {
+          "LaunchTemplateId": { "Ref": "StunLaunchTemplate" },
+          "Version": { "Fn::GetAtt": [ "StunLaunchTemplate", "LatestVersionNumber" ] }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": { "Fn::Sub": "stunserver-${AWS::Region}" },
+            "PropagateAtLaunch": true
+          }
+        ]
+      }
+    },
+
+    "StunDnsRecord": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneId": { "Ref": "HostedZoneId" },
+        "Name": "stunc.mitel.io.",
+        "Type": "A",
+        "TTL": "60",
+        "SetIdentifier": { "Fn::Sub": "stunserver-${AWS::Region}" },
+        "Region": { "Ref": "AWS::Region" },
+        "ResourceRecords": [ { "Fn::GetAtt": [ "EIP1", "PublicIp" ] } ]
+      }
+    }
+
+  },
+
+  "Outputs": {
+    "PublicIP1": {
+      "Description": "Primary Elastic IP (eth0) — used in DNS for stunc.mitel.io",
+      "Value": { "Fn::GetAtt": [ "EIP1", "PublicIp" ] }
+    },
+    "PublicIP2": {
+      "Description": "Alternate Elastic IP (eth1) — used by stunserver full mode",
+      "Value": { "Fn::GetAtt": [ "EIP2", "PublicIp" ] }
+    },
+    "AutoScalingGroup": {
+      "Description": "Name of the Auto Scaling Group managing the STUN server instance",
+      "Value": { "Ref": "StunASG" }
+    }
+  }
+
+}
