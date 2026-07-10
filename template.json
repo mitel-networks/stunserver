@@ -12,12 +12,12 @@
   "Mappings": {
     "RegionMap": {
       "us-east-1": {
-        "AmiId": "PLACEHOLDER_AMI_ID",
-        "KeyName": "PLACEHOLDER_KEY_NAME"
+        "AmiId": "ami-07e88eae8fab7dd8a",
+        "KeyName": "stunserver"
       },
       "eu-central-1": {
-        "AmiId": "PLACEHOLDER_AMI_ID",
-        "KeyName": "PLACEHOLDER_KEY_NAME"
+        "AmiId": "ami-0f926ea13b394bbf1",
+        "KeyName": "stunserver"
       }
     }
   },
@@ -162,6 +162,17 @@
                   "Effect": "Allow",
                   "Action": "ec2:DescribeNetworkInterfaces",
                   "Resource": "*"
+                },
+                {
+                  "Sid": "CreateAndAttachAltEni",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:CreateNetworkInterface",
+                    "ec2:AttachNetworkInterface",
+                    "ec2:ModifyNetworkInterfaceAttribute",
+                    "ec2:CreateTags"
+                  ],
+                  "Resource": "*"
                 }
               ]
             }
@@ -208,13 +219,8 @@
               "DeviceIndex": 0,
               "SubnetId": { "Ref": "StunSubnet" },
               "Groups": [ { "Ref": "StunSecurityGroup" } ],
-              "DeleteOnTermination": true
-            },
-            {
-              "DeviceIndex": 1,
-              "SubnetId": { "Ref": "StunSubnet" },
-              "Groups": [ { "Ref": "StunSecurityGroup" } ],
-              "DeleteOnTermination": true
+              "DeleteOnTermination": true,
+              "AssociatePublicIpAddress": true
             }
           ],
           "UserData": {
@@ -226,6 +232,7 @@
                 "# ── IMDSv2 token ──────────────────────────────────────────",
                 "TOKEN=$(curl -sXPUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')",
                 "IMDS='http://169.254.169.254/latest/meta-data'",
+                "INSTANCE_ID=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/instance-id\")",
                 "",
                 "# ── Install dependencies ──────────────────────────────────",
                 "dnf install -y awscli jq",
@@ -249,15 +256,32 @@
                 "dnf install -y stunserver",
                 "systemctl unmask stunserver.service",
                 "",
-                "# ── Resolve ENI IDs for DeviceIndex 0 and 1 ─────────────",
+                "# ── Resolve ENI0 (the only NIC present at boot) ──────────",
                 "ENI0_ID=''",
-                "ENI1_ID=''",
                 "for MAC in $(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/\"); do",
                 "  MAC=$(echo \"$MAC\" | tr -d '/')",
                 "  DEV=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/device-number\")",
                 "  ENI=$(curl -sH \"X-aws-ec2-metadata-token: $TOKEN\" \"$IMDS/network/interfaces/macs/$MAC/interface-id\")",
                 "  if [ \"$DEV\" = '0' ]; then ENI0_ID=$ENI; fi",
-                "  if [ \"$DEV\" = '1' ]; then ENI1_ID=$ENI; fi",
+                "done",
+                "",
+                "# ── Create and attach the alternate NIC (eth1) ───────────",
+                "# eth1 is not in the launch template because ASG rejects AssociatePublicIpAddress",
+                "# on launch templates with multiple NICs, and eth0 needs a public IP at boot so",
+                "# this script itself has internet access (dnf, Secrets Manager, EIP association).",
+                { "Fn::Sub": "ENI1_ID=$(aws ec2 create-network-interface --subnet-id ${StunSubnet} --groups ${StunSecurityGroup} --description stunserver-eth1 --region ${AWS::Region} --query NetworkInterface.NetworkInterfaceId --output text)" },
+                { "Fn::Sub": "ATTACHMENT_ID=$(aws ec2 attach-network-interface --network-interface-id \"$ENI1_ID\" --instance-id \"$INSTANCE_ID\" --device-index 1 --region ${AWS::Region} --query AttachmentId --output text)" },
+                { "Fn::Sub": "aws ec2 modify-network-interface-attribute --network-interface-id \"$ENI1_ID\" --attachment AttachmentId=$ATTACHMENT_ID,DeleteOnTermination=true --region ${AWS::Region}" },
+                "",
+                "# ── Wait for eth1 to appear and get configured at the OS level ─",
+                "for i in $(seq 1 30); do",
+                "  if ip link show eth1 &>/dev/null; then break; fi",
+                "  sleep 2",
+                "done",
+                "systemctl restart nm-cloud-setup.service || true",
+                "for i in $(seq 1 30); do",
+                "  if ip -4 addr show dev eth1 2>/dev/null | grep -q 'inet '; then break; fi",
+                "  sleep 2",
                 "done",
                 "",
                 "# ── Associate Elastic IPs ─────────────────────────────────",

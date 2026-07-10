@@ -21,7 +21,8 @@ jobs:
             make \
             openssl-devel \
             boost-devel \
-            rpm-build
+            rpm-build \
+            systemd-rpm-macros
 
       - name: Checkout
         uses: actions/checkout@v4
