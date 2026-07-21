@@ -209,6 +209,20 @@
       }
     },
 
+    "StunHealthCheck": {
+      "Type": "AWS::Route53::HealthCheck",
+      "Properties": {
+        "HealthCheckConfig": {
+          "IPAddress": { "Fn::GetAtt": [ "EIP1", "PublicIp" ] },
+          "Port": 22,
+          "Type": "TCP",
+          "RequestInterval": 30,
+          "FailureThreshold": 3
+        },
+        "HealthCheckTags": [{ "Key": "Name", "Value": { "Fn::Sub": "stunserver-hc-${AWS::Region}" } }]
+      }
+    },
+
     "EIP2": {
       "Type": "AWS::EC2::EIP",
       "Properties": {
@@ -387,6 +401,7 @@
         "TTL": "60",
         "SetIdentifier": { "Fn::Sub": "stunserver-${AWS::Region}" },
         "Region": { "Ref": "AWS::Region" },
+        "HealthCheckId": { "Ref": "StunHealthCheck" },
         "ResourceRecords": [ { "Fn::GetAtt": [ "EIP1", "PublicIp" ] } ]
       }
     }
