@@ -18,6 +18,18 @@
       "eu-central-1": {
         "AmiId": "ami-0f926ea13b394bbf1",
         "KeyName": "stunserver"
+      },
+      "sa-east-1": {
+        "AmiId": "ami-0dbe67d4f27bb72bc",
+        "KeyName": "stunserver"
+      },
+      "eu-west-3": {
+        "AmiId": "ami-0856571822cc2a7d9",
+        "KeyName": "stunserver"
+      },
+      "ap-southeast-2": {
+        "AmiId": "ami-059a26205fdaa13ea",
+        "KeyName": "stunserver"
       }
     }
   },
