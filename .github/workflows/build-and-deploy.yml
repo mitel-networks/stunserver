@@ -21,6 +21,13 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Only for the registry credential, which lives on this environment so it
+    # is released to v* tags alone (see the environment's deployment rules),
+    # not to every workflow run in this public repo. No approval is needed, and
+    # deployment: false stops it showing up as a deployment.
+    environment:
+      name: publish
+      deployment: false
     permissions:
       contents: read
     outputs:
@@ -39,6 +46,16 @@ jobs:
             exit 1
           fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Fail now, not after the whole build, if the credential is missing.
+      - name: Check configuration
+        env:
+          ARTIFACTORYTOKEN: ${{ secrets.ARTIFACTORYTOKEN }}
+        run: |
+          if [ -z "$ARTIFACTORYTOKEN" ]; then
+            echo "::error::The ARTIFACTORYTOKEN secret is empty. Add it as a secret on the publish environment."
+            exit 1
+          fi
 
       - name: Install build dependencies
         run: |
@@ -135,8 +152,11 @@ jobs:
       - name: Check every region has a replicated secret
         run: PATH="$RUNNER_TEMP/venv/bin:$PATH" .github/scripts/check-replica-regions.sh infra/regions.json infra/bootstrap.yaml
 
-      - name: Find previous tag
+      # The last tag that was actually released, i.e. what is deployed now.
+      - name: Find previous release
         id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: echo "tag=$(.github/scripts/release-notes.sh --previous "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
 
       # Only regions removed in this release's diff may be deleted from the
@@ -169,6 +189,7 @@ jobs:
           ADDED: ${{ steps.regions.outputs.added }}
           KNOWN: ${{ steps.regions.outputs.known }}
           ALL: ${{ steps.regions.outputs.all }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           {
             echo "## Deploying ${GITHUB_REF_NAME}"
