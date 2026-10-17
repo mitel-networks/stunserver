@@ -107,10 +107,14 @@ jobs:
           RPM_FILE: ${{ steps.build_rpm.outputs.rpm_file }}
           RPM_NAME: ${{ steps.build_rpm.outputs.rpm_name }}
         run: |
-          curl -fsS \
+          # The registry's JSON reply names the uploading account and the
+          # internal path, and this log is public: discard the body. -f still
+          # fails the step on any HTTP error.
+          curl -fsS -o /dev/null \
             -H "X-JFrog-Art-Api: ${ARTIFACTORYTOKEN}" \
             -T "${RPM_FILE}" \
             "https://artifactory.mitel.com/artifactory/stunserver-rpm-internal/${RPM_NAME}"
+          echo "Published ${RPM_NAME}"
 
   # No secrets and no AWS: works out what this release changes, for the
   # approval screen, and refuses an inconsistent fleet before anyone is asked
