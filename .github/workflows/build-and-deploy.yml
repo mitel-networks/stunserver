@@ -235,6 +235,8 @@ jobs:
       id-token: write
       contents: read
     uses: ./.github/workflows/deploy.yml
+    secrets:
+      AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
     with:
       version: ${{ needs.build-rpm.outputs.version }}
       ref: ${{ github.ref_name }}

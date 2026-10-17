@@ -91,6 +91,8 @@ jobs:
       id-token: write
       contents: read
     uses: ./.github/workflows/deploy.yml
+    secrets:
+      AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
     with:
       version: ${{ inputs.version }}
       ref: v${{ inputs.version }}

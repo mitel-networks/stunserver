@@ -27,6 +27,10 @@ on:
           the only ones that may be deleted.
         type: string
         default: ''
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        description: ARN of stunserver-deploy-role. A secret so the account ID in it is masked in this public log.
+        required: true
     outputs:
       domain_name:
         description: The DNS name the StackSet serves, read back after a successful deploy. Empty if the deployed template has none.
@@ -80,16 +84,19 @@ jobs:
           sparse-checkout: infra/service.yaml
           sparse-checkout-cone-mode: false
 
-      # The role ARN is a secret on the production environment, not part of
+      # The role ARN is a repository secret passed in by the caller, not part of
       # this public repository. A secret rather than a variable so that the
       # account ID in it is masked in this public log, including where GitHub
-      # echoes step inputs.
+      # echoes step inputs. It cannot be an environment secret: a called
+      # workflow only sees the secrets its caller passes, and the calling job
+      # has no environment. It is only an identifier; the role's trust policy
+      # (this repo's production environment) is what protects it.
       - name: Check configuration
         env:
           ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
         run: |
           if ! [[ $ROLE_ARN =~ ^arn:aws:iam::[0-9]{12}:role/stunserver-deploy-role$ ]]; then
-            echo "::error::Set the AWS_DEPLOY_ROLE_ARN secret on the production environment to the stunserver-deploy-role ARN."
+            echo "::error::Set the AWS_DEPLOY_ROLE_ARN repository secret to the stunserver-deploy-role ARN."
             exit 1
           fi
 
