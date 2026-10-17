@@ -23,10 +23,6 @@ Parameters:
       SSM public parameter naming the Amazon Linux 2023 AMI. It resolves in
       each region when the StackSet is updated, so every deploy runs on the
       current image.
-  KeyName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Default: stunserver
-    Description: EC2 key pair for SSH. Goes away together with port 22.
   StatusPort:
     Type: Number
     Default: 18080
@@ -97,6 +93,9 @@ Resources:
   StunSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
+      # Left exactly as it was: GroupDescription cannot be changed in place, and
+      # changing it would replace the group and every network interface in it.
+      # It predates the removal of SSH, which is why it still mentions it.
       GroupDescription: "STUN server: UDP 3478/3479 inbound, SSH inbound"
       VpcId: !Ref StunVPC
       SecurityGroupIngress:
@@ -110,11 +109,6 @@ Resources:
           ToPort: 3479
           CidrIp: 0.0.0.0/0
           Description: STUN alternate port UDP
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
-          Description: SSH
         - IpProtocol: tcp
           FromPort: !Ref StatusPort
           ToPort: !Ref StatusPort
@@ -226,7 +220,6 @@ Resources:
       LaunchTemplateData:
         InstanceType: t3.small
         ImageId: !Ref LatestAl2023AmiId
-        KeyName: !Ref KeyName
         IamInstanceProfile:
           Name: !Ref StunInstanceProfile
         NetworkInterfaces:
