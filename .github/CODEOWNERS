@@ -1,0 +1,5 @@
+# A tag push ships whatever is in this repository: the workflows and scripts,
+# the CloudFormation templates, and the source and packaging that become the
+# RPM running on the production servers. Everything needs a dev-ops review.
+# Takes effect once the branch ruleset on master requires Code Owner review.
+*  @mitel-networks/dev-ops

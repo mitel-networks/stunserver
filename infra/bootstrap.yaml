@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  stunserver's one-time, manually deployed foundations: the Secrets Manager
+  secret holding the package registry credential (replicated to every region
+  the service StackSet targets) and the GitHub OIDC deploy role. Deployed by
+  hand, never by the release pipeline, so a release cannot change its own
+  trust or permissions. Deploy it in the StackSet's administration region
+  (us-east-1). The secret's value is entered manually in the primary region.
+  IMPORTANT: ReplicaRegions must list every region in infra/regions.json other
+  than us-east-1. A region added to the fleet without a matching entry here
+  leaves that region's instances unable to read the secret.
+
+Parameters:
+  GithubOidcProviderArn:
+    Type: String
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:oidc-provider/token\.actions\.githubusercontent\.com$'
+    Description: >-
+      ARN of the account's IAM OIDC identity provider for
+      token.actions.githubusercontent.com, created by hand and trusted by the
+      deploy role.
+  StackSetName:
+    Type: String
+    Default: stunserver
+    Description: >-
+      Name of the self-managed StackSet (infra/service.yaml) the pipeline
+      updates. The deploy role is scoped to it.
+
+Resources:
+  ArtifactorySecret:
+    Type: AWS::SecretsManager::Secret
+    # The value was entered by hand and cannot be recreated by this stack, so
+    # deleting or replacing the stack must never delete the secret.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: artifactory/stunserver
+      Description: >-
+        Package registry read credential used by new instances at boot.
+        Populate manually in us-east-1 as JSON with username and token keys;
+        Secrets Manager replicates it to the other regions.
+      ReplicaRegions:
+        - Region: eu-central-1
+        - Region: sa-east-1
+        - Region: eu-west-3
+        - Region: ap-southeast-2
+
+  # Assumable only by a job in this repo's GitHub "production" environment,
+  # i.e. one that has passed the approval. A job with an environment gets an
+  # environment sub claim rather than a ref one, so a bare tag push cannot
+  # reach AWS. Both sub formats GitHub can issue for this repo are listed
+  # exactly (name-based and immutable ID-based), with no wildcards. The role
+  # only drives the StackSet's operations: the work itself is done by the
+  # StackSet's own administration and execution roles, so this role holds no
+  # EC2, IAM or VPC permissions. It has no UpdateStackInstances, so the
+  # pipeline cannot set per-instance parameter overrides.
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stunserver-deploy-role
+      # A deploy updates the regions one after another, each waiting for its
+      # replacement instance, so it can outlast the default one hour.
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GithubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - repo:mitel-networks/stunserver:environment:production
+                  - repo:mitel-networks@15935705/stunserver@1245701910:environment:production
+      Policies:
+        - PolicyName: stunserver-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DriveServiceStackSet
+                Effect: Allow
+                Action:
+                  - cloudformation:UpdateStackSet
+                  - cloudformation:CreateStackInstances
+                  - cloudformation:DeleteStackInstances
+                  - cloudformation:DescribeStackSet
+                  - cloudformation:DescribeStackSetOperation
+                  - cloudformation:DescribeStackInstance
+                  - cloudformation:ListStackInstances
+                  - cloudformation:ListStackSetOperationResults
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/${StackSetName}:*"
+              - Sid: ReadTemplate
+                Effect: Allow
+                Action: cloudformation:GetTemplateSummary
+                Resource: '*'
+              - Sid: AdministrationRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/AWSCloudFormationStackSetAdministrationRole"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              # service.yaml resolves the AMI from an SSM public parameter in
+              # each region.
+              - Sid: ResolveAmiParameter
+                Effect: Allow
+                Action: ssm:GetParameters
+                Resource: arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*
+              # Before a region is added, confirms the secret is replicated
+              # into it.
+              - Sid: CheckSecretReplication
+                Effect: Allow
+                Action: secretsmanager:DescribeSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:artifactory/stunserver-*"
+              # After a deploy, confirms each region runs exactly one
+              # instance on the new version and finds its addresses for the
+              # external probe. Read-only, any region.
+              - Sid: VerifyFleet
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                  - ec2:DescribeAddresses
+                Resource: '*'
+              # Orders the rollout quietest region first, from each ASG's
+              # inbound packet count. Read-only, any region.
+              - Sid: RankRegionsByTraffic
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                Resource: '*'
+
+Outputs:
+  ArtifactorySecretArn:
+    Description: For reference only. service.yaml reads the secret by name in each region.
+    Value: !Ref ArtifactorySecret
+  DeployRoleArn:
+    Description: Role the release workflow assumes via GitHub OIDC.
+    Value: !GetAtt DeployRole.Arn

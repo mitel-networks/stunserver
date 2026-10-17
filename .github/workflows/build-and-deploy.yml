@@ -1,0 +1,247 @@
+name: Build and Deploy
+
+# A tag like v1.2.20 builds the RPM, publishes it to the private package
+# registry, waits for approval of the "production" environment, rolls the new
+# version and infra/service.yaml out to every region, and only then creates a
+# GitHub release. See deploy.yml for the rollout itself.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Per-job grants below; nothing is granted by default.
+permissions: {}
+
+jobs:
+  build-rpm:
+    name: Build RPM (Amazon Linux 2023)
+    runs-on: ubuntu-latest
+    container:
+      image: amazonlinux:2023
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      # First, before anything uses the tag name: only plain release tags
+      # build and deploy.
+      - name: Validate tag and extract version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag is not a release tag like v1.2.3"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            git \
+            gcc-c++ \
+            make \
+            openssl-devel \
+            boost-devel \
+            rpm-build \
+            systemd-rpm-macros
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare rpmbuild tree
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p "$HOME/rpmbuild/"{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp -a "$GITHUB_WORKSPACE" "/tmp/stunserver-${VERSION}"
+          tar czf "$HOME/rpmbuild/SOURCES/stunserver-${VERSION}.tar.gz" \
+            -C /tmp "stunserver-${VERSION}"
+          cp rpm/stunserver.spec "$HOME/rpmbuild/SPECS/"
+
+      - name: Build RPM
+        id: build_rpm
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          rpmbuild -bb \
+            --define "pkg_version ${VERSION}" \
+            --define "_topdir $HOME/rpmbuild" \
+            "$HOME/rpmbuild/SPECS/stunserver.spec"
+          RPM_FILE=$(find "$HOME/rpmbuild/RPMS" -name "stunserver-*.rpm" | head -1)
+          echo "rpm_file=${RPM_FILE}" >> "$GITHUB_OUTPUT"
+          echo "rpm_name=$(basename "${RPM_FILE}")" >> "$GITHUB_OUTPUT"
+
+      # Published before the deploy is approved: new instances install it
+      # from here at launch, pinned to this exact version. Not production,
+      # just the private registry, so an unapproved or rejected tag leaving an
+      # unused RPM behind is harmless. It is deliberately not kept as a build
+      # artifact or attached to the release: both are public on this repo.
+      - name: Upload RPM to Artifactory
+        env:
+          ARTIFACTORYTOKEN: ${{ secrets.ARTIFACTORYTOKEN }}
+          RPM_FILE: ${{ steps.build_rpm.outputs.rpm_file }}
+          RPM_NAME: ${{ steps.build_rpm.outputs.rpm_name }}
+        run: |
+          curl -fsS \
+            -H "X-JFrog-Art-Api: ${ARTIFACTORYTOKEN}" \
+            -T "${RPM_FILE}" \
+            "https://artifactory.mitel.com/artifactory/stunserver-rpm-internal/${RPM_NAME}"
+
+  # No secrets and no AWS: works out what this release changes, for the
+  # approval screen, and refuses an inconsistent fleet before anyone is asked
+  # to approve.
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      removed_regions: ${{ steps.regions.outputs.removed }}
+    steps:
+      # Full history + tags (not just the tag that triggered this run) -
+      # needed to find the previous release tag and diff against it.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Validate tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag is not a release tag like v1.2.3"
+            exit 1
+          fi
+
+      - name: Install PyYAML
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet 'pyyaml==6.0.3'
+
+      # A region added to infra/regions.json needs the secret replicated into
+      # it first (ReplicaRegions in infra/bootstrap.yaml, deployed by hand),
+      # or its instances cannot start. Fails here, before approval.
+      - name: Check every region has a replicated secret
+        run: PATH="$RUNNER_TEMP/venv/bin:$PATH" .github/scripts/check-replica-regions.sh infra/regions.json infra/bootstrap.yaml
+
+      - name: Find previous tag
+        id: previous
+        run: echo "tag=$(.github/scripts/release-notes.sh --previous "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+
+      # Only regions removed in this release's diff may be deleted from the
+      # fleet (deploy-stackset.sh enforces this); they are shown on the
+      # approval screen below. A previous tag without regions.json (the
+      # release that introduced it) has no diff to show.
+      - name: Work out region changes
+        id: regions
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          CURRENT=$(cat infra/regions.json)
+          if [ -n "$PREVIOUS_TAG" ] && git cat-file -e "${PREVIOUS_TAG}:infra/regions.json" 2>/dev/null; then
+            PREVIOUS=$(git show "${PREVIOUS_TAG}:infra/regions.json")
+            echo "removed=$(jq -rn --argjson p "$PREVIOUS" --argjson c "$CURRENT" '$p - $c | join(" ")')" >> "$GITHUB_OUTPUT"
+            echo "added=$(jq -rn --argjson p "$PREVIOUS" --argjson c "$CURRENT" '$c - $p | join(" ")')" >> "$GITHUB_OUTPUT"
+            echo "known=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "removed=" >> "$GITHUB_OUTPUT"
+            echo "added=" >> "$GITHUB_OUTPUT"
+            echo "known=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "all=$(jq -r 'join(", ")' <<<"$CURRENT")" >> "$GITHUB_OUTPUT"
+
+      # Shown on the approval screen.
+      - name: Summarize what this release deploys
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          REMOVED: ${{ steps.regions.outputs.removed }}
+          ADDED: ${{ steps.regions.outputs.added }}
+          KNOWN: ${{ steps.regions.outputs.known }}
+          ALL: ${{ steps.regions.outputs.all }}
+        run: |
+          {
+            echo "## Deploying ${GITHUB_REF_NAME}"
+            echo
+            echo "- Fleet regions (infra/regions.json): ${ALL}"
+            if [ "$KNOWN" = true ]; then
+              [ -z "$ADDED" ] || echo "- **Adding regions: ${ADDED}** (the secret is replicated there; new fleets will be created)"
+              [ -z "$REMOVED" ] || echo "- **REMOVING regions: ${REMOVED}** (this deletes the STUN server there)"
+              [ -n "$ADDED$REMOVED" ] || echo "- No region changes since ${PREVIOUS_TAG}."
+            else
+              echo "- No earlier regions.json to compare against: the live StackSet is reconciled with it at deploy time, and a region it has that the file lacks stops the deploy."
+            fi
+            echo
+            if [ -z "$PREVIOUS_TAG" ]; then
+              echo "- First release: the StackSet will be updated to this template."
+            elif git diff --quiet "${PREVIOUS_TAG}" "${GITHUB_REF_NAME}" -- infra/service.yaml; then
+              echo "- \`infra/service.yaml\` is **unchanged** since ${PREVIOUS_TAG}: only the server version changes."
+            else
+              echo "- \`infra/service.yaml\` **changed** since ${PREVIOUS_TAG}: every region's stack will be updated too."
+              echo
+              echo '```diff'
+              git diff "${PREVIOUS_TAG}" "${GITHUB_REF_NAME}" -- infra/service.yaml
+              echo '```'
+            fi
+            if [ -n "$PREVIOUS_TAG" ] && ! git diff --quiet "${PREVIOUS_TAG}" "${GITHUB_REF_NAME}" -- infra/bootstrap.yaml; then
+              echo
+              echo "- **\`infra/bootstrap.yaml\` changed** since ${PREVIOUS_TAG}. It is deployed by hand, never by this pipeline: make sure that was done."
+            fi
+            echo
+            .github/scripts/release-notes.sh "${GITHUB_REF_NAME}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Waits for approval, then updates the StackSet across every region and
+  # checks the fleet is on the new version. See deploy.yml.
+  deploy:
+    name: Deploy
+    needs: [build-rpm, prepare]
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy.yml
+    with:
+      version: ${{ needs.build-rpm.outputs.version }}
+      ref: ${{ github.ref_name }}
+      reconcile: true
+      removed_regions: ${{ needs.prepare.outputs.removed_regions }}
+
+  # Only runs once the deploy has succeeded in every region, so a release
+  # always means "this is live". A rejected or failed deploy leaves the tag
+  # without a release. The release holds the changelog only: no package, and
+  # no link to the private registry.
+  create-release:
+    name: Create GitHub Release
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DOMAIN: ${{ needs.deploy.outputs.domain_name }}
+        run: |
+          .github/scripts/release-notes.sh "$GITHUB_REF_NAME" "$DOMAIN" > release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

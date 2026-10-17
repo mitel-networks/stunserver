@@ -16,6 +16,8 @@ BuildRequires:  boost-devel
 BuildRequires:  systemd-rpm-macros
 
 Requires(pre):  shadow-utils
+# The status endpoint (stunserver-health) is a Python script.
+Requires:       python3
 %{?systemd_requires}
 
 %description
@@ -35,6 +37,11 @@ install -m 0755 stunserver %{buildroot}%{_bindir}/stunserver
 install -m 0755 stunclient %{buildroot}%{_bindir}/stunclient
 install -D -m 0644 rpm/stunserver.service \
     %{buildroot}%{_unitdir}/stunserver.service
+install -D -m 0755 rpm/stunserver-health \
+    %{buildroot}%{_libexecdir}/stunserver/stunserver-health
+install -D -m 0644 rpm/stunserver-health.service \
+    %{buildroot}%{_unitdir}/stunserver-health.service
+install -d -m 0755 %{buildroot}%{_sysconfdir}/stunserver
 
 %pre
 getent group stunserver >/dev/null || groupadd -r stunserver
@@ -44,22 +51,28 @@ getent passwd stunserver >/dev/null || \
 exit 0
 
 %post
-%systemd_post stunserver.service
+%systemd_post stunserver.service stunserver-health.service
 if [ $1 -eq 1 ] ; then
     systemctl start stunserver.service >/dev/null 2>&1 || :
 fi
+# stunserver-health is deliberately not started here: it needs the
+# environment file written at first boot, which enables and starts it.
 
 %preun
-%systemd_preun stunserver.service
+%systemd_preun stunserver.service stunserver-health.service
 
 %postun
-%systemd_postun_with_restart stunserver.service
+%systemd_postun_with_restart stunserver.service stunserver-health.service
 
 %files
 %license LICENSE
 %{_bindir}/stunserver
 %{_bindir}/stunclient
 %{_unitdir}/stunserver.service
+%{_unitdir}/stunserver-health.service
+%dir %{_libexecdir}/stunserver
+%{_libexecdir}/stunserver/stunserver-health
+%dir %{_sysconfdir}/stunserver
 
 %changelog
 * Tue May 27 2025 CI Build <ci@mitel.com> - %{version}-1

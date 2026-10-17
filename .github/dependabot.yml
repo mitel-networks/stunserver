@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Every action is pinned to a full commit SHA, so none of them updates by
+  # itself. This opens one weekly pull request that moves the pins forward;
+  # CODEOWNERS makes dev-ops review it, like any other change to .github/.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a new release age a week before it is proposed.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"

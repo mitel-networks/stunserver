@@ -1,0 +1,128 @@
+name: Deploy
+
+# Reusable: called by build-and-deploy.yml (a release) and rollback.yml, so
+# both go through the same approval, the same StackSet rollout and the same
+# check that every region is on the new version.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to deploy, without the leading "v" (e.g. 1.2.20).
+        type: string
+        required: true
+      ref:
+        description: Git ref whose infra/service.yaml is applied (e.g. v1.2.20).
+        type: string
+        required: true
+      reconcile:
+        description: >
+          Add and remove regions to match infra/regions.json. False updates
+          only the regions the StackSet already has (a rollback must not
+          change the fleet's regions).
+        type: boolean
+        default: false
+      removed_regions:
+        description: >
+          Space-separated regions this release removed from regions.json,
+          the only ones that may be deleted.
+        type: string
+        default: ''
+    outputs:
+      domain_name:
+        description: The DNS name the StackSet serves, read back after a successful deploy. Empty if the deployed template has none.
+        value: ${{ jobs.deploy.outputs.domain_name }}
+
+# Per-job grants below; nothing is granted by default.
+permissions: {}
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    # Pauses here until a reviewer approves the "production" environment.
+    # The environment's deployment goes green on the repo only if every
+    # region ends up on the new version.
+    environment:
+      name: production
+    # Two deploys must never run at once.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    # Regions update one at a time, each waiting for its replacement instance
+    # to pass its own health check, so a deploy takes a while and grows with
+    # the fleet.
+    timeout-minutes: 90
+    permissions:
+      id-token: write # the OIDC AssumeRoleWithWebIdentity exchange
+      contents: read
+    outputs:
+      domain_name: ${{ steps.domain.outputs.name }}
+    steps:
+      # The scripts and regions.json come from the ref that started this
+      # run: the tag for a release, master for a rollback (an old tag may
+      # predate them, and a rollback must not take its region list from one).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Only the template comes from the target version, so a rollback
+      # applies exactly the infrastructure that release ran.
+      - name: Checkout ${{ inputs.ref }} template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: target
+          persist-credentials: false
+          sparse-checkout: infra/service.yaml
+          sparse-checkout-cone-mode: false
+
+      # The role ARN is a variable on the production environment, not part of
+      # this public repository.
+      - name: Check configuration
+        env:
+          ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if ! [[ $ROLE_ARN =~ ^arn:aws:iam::[0-9]{12}:role/stunserver-deploy-role$ ]]; then
+            echo "::error::Set the AWS_DEPLOY_ROLE_ARN variable on the production environment to the stunserver-deploy-role ARN."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Roll out to the StackSet
+        env:
+          VERSION: ${{ inputs.version }}
+          TEMPLATE: target/infra/service.yaml
+          REGIONS_FILE: infra/regions.json
+          RECONCILE: ${{ inputs.reconcile }}
+          REMOVED_REGIONS: ${{ inputs.removed_regions }}
+        run: .github/scripts/deploy-stackset.sh
+
+      - name: Verify every region is on the new version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: .github/scripts/verify-fleet.sh
+
+      # Read back from the live StackSet rather than written down here, so
+      # the release says what is actually deployed.
+      - name: Read the live domain name
+        id: domain
+        run: |
+          DOMAIN=$(aws cloudformation describe-stack-set --stack-set-name stunserver \
+            --query "StackSet.Parameters[?ParameterKey=='DomainName'].ParameterValue | [0]" --output text)
+          if [ "$DOMAIN" = None ]; then
+            DOMAIN=""
+          elif ! [[ $DOMAIN =~ ^[a-z0-9.-]+$ ]]; then
+            echo "::error::The StackSet's DomainName is not a plain DNS name."
+            exit 1
+          fi
+          echo "name=${DOMAIN}" >> "$GITHUB_OUTPUT"

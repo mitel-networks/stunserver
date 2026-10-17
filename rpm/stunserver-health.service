@@ -1,0 +1,43 @@
+[Unit]
+Description=STUN server status endpoint and self-health check
+After=network-online.target stunserver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Written at first boot: STATUS_BIND, STATUS_PORT, PRIMARY_EIP, ALT_EIP.
+EnvironmentFile=/etc/stunserver/health.env
+ExecStart=/usr/libexec/stunserver/stunserver-health
+Restart=always
+RestartSec=2s
+
+# Listens on the internet, so run with as little as possible. It needs the
+# network, the instance metadata service and, to report itself unhealthy, the
+# aws CLI (which wants a writable home for its cache).
+DynamicUser=yes
+StateDirectory=stunserver-health
+Environment=HOME=/var/lib/stunserver-health
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

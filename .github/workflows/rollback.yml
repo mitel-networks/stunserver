@@ -1,0 +1,97 @@
+name: Rollback
+
+# Redeploys an earlier release to every region the fleet is in: its
+# already-published RPM and the infra/service.yaml committed at its tag. The
+# fleet's set of regions is left exactly as it is. Goes through the same
+# approval and the same per-region check as a release (deploy.yml).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Version to deploy, without the leading "v" (e.g. 1.2.19). Must have
+          a published GitHub release.
+        type: string
+        required: true
+
+# Per-job grants below; nothing is granted by default.
+permissions: {}
+
+jobs:
+  # No secrets and no AWS: checks the request is sane and shows the approver
+  # what will change before they are asked to approve. Only runs from the
+  # default branch, whatever ref it was dispatched from.
+  validate:
+    name: Validate and summarize
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Validate and summarize
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version is not like 1.2.19 (no leading v)"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} does not exist"
+            exit 1
+          fi
+          # The deploy applies the template committed at the tag.
+          if ! git cat-file -e "v${VERSION}:infra/service.yaml" 2>/dev/null; then
+            echo "::error::v${VERSION} has no infra/service.yaml: it predates this pipeline and cannot be rolled back to."
+            exit 1
+          fi
+          # A release is only created after its deploy succeeded, so this
+          # restricts rollbacks to versions that were once live.
+          if ! gh release view "v${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::v${VERSION} has no GitHub release, so it never finished deploying. Re-run that release's failed jobs instead."
+            exit 1
+          fi
+
+          # Nothing here can ask what is deployed, so the latest release
+          # stands in for "what is deployed now".
+          LATEST=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)
+
+          {
+            echo "## Rolling back to v${VERSION}"
+            echo
+            echo "- Every region the fleet is currently in will be set to v${VERSION}. Regions are not added or removed."
+            if [ "$LATEST" = "v${VERSION}" ]; then
+              echo "- v${VERSION} is the latest release, which is probably what is already deployed: expect a no-op."
+            else
+              echo "- Latest release (assumed to be deployed now): **${LATEST}**."
+              if git diff --quiet "${LATEST}" "v${VERSION}" -- infra/service.yaml; then
+                echo "- \`infra/service.yaml\` is identical in both versions."
+              else
+                echo "- \`infra/service.yaml\` differs: every region's stack will be set to v${VERSION}'s template."
+                echo
+                echo '```diff'
+                git diff "${LATEST}" "v${VERSION}" -- infra/service.yaml
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy
+    needs: validate
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: v${{ inputs.version }}
+      reconcile: false

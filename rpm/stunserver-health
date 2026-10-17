@@ -1,0 +1,289 @@
+#!/usr/bin/python3
+"""Status endpoint and self-health check for the STUN server on its EC2 instance.
+
+One process does three things:
+
+  * Every CHECK_INTERVAL seconds it checks that the server really works: both
+    network interfaces are present, each carries the expected Elastic IP, and
+    each answers a STUN Binding request on every STUN port.
+  * It answers HTTP on STATUS_BIND:STATUS_PORT with "200 OK" while the last
+    check passed and "503 Service Unavailable" otherwise. Route 53 health-checks
+    this, so an unhealthy region drops out of DNS. The request is never parsed
+    or used: every request gets the same answer, so there is nothing to
+    exploit. If the checker itself hangs, its result goes stale and the answer
+    becomes 503, so a wedged process fails closed.
+  * If the checks keep failing for UNHEALTHY_AFTER seconds it reports the
+    instance Unhealthy to its Auto Scaling group, which replaces it.
+
+The same pass/fail result is what the instance waits for before it tells
+CloudFormation a rollout succeeded.
+
+Environment (from /etc/stunserver/health.env, except where noted):
+  STATUS_BIND      address to listen on (required): the primary NIC's private IP
+  STATUS_PORT      TCP port to listen on (default 18080)
+  PRIMARY_EIP      Elastic IP expected on the primary NIC (optional)
+  ALT_EIP          Elastic IP expected on the alternate NIC (optional)
+  STUN_PORTS       comma-separated UDP ports to probe (default 3478,3479)
+  CHECK_INTERVAL   seconds between checks (default 5)
+  UNHEALTHY_AFTER  seconds of continuous failure before self-reporting (default 120)
+  STALE_AFTER      seconds without a finished check before answering 503 (default 30)
+  MAX_CONNECTIONS  concurrent HTTP connections served (default 64)
+  IMDS_BASE        instance metadata endpoint (default http://169.254.169.254)
+  AWS_BIN          aws CLI used to self-report (default "aws")
+
+Usage: stunserver-health            serve and check until stopped
+       stunserver-health --check    run one check, print the result, exit 0/1
+"""
+import asyncio
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+MAGIC_COOKIE = 0x2112A442
+BINDING_REQUEST = 0x0001
+BINDING_SUCCESS = 0x0101
+MAPPED_ADDRESS = 0x0001
+XOR_MAPPED_ADDRESS = 0x0020
+
+STATUS_BIND = os.environ.get("STATUS_BIND", "")
+STATUS_PORT = int(os.environ.get("STATUS_PORT", "18080"))
+PRIMARY_EIP = os.environ.get("PRIMARY_EIP", "")
+ALT_EIP = os.environ.get("ALT_EIP", "")
+STUN_PORTS = [int(p) for p in os.environ.get("STUN_PORTS", "3478,3479").split(",")]
+CHECK_INTERVAL = float(os.environ.get("CHECK_INTERVAL", "5"))
+UNHEALTHY_AFTER = float(os.environ.get("UNHEALTHY_AFTER", "120"))
+STALE_AFTER = float(os.environ.get("STALE_AFTER", "30"))
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "64"))
+IMDS_BASE = os.environ.get("IMDS_BASE", "http://169.254.169.254")
+AWS_BIN = os.environ.get("AWS_BIN", "aws")
+
+# The status line doubles as the plain-text body.
+RESPONSES = {True: b"200 OK", False: b"503 Service Unavailable"}
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# --- instance metadata -------------------------------------------------------
+
+
+def imds_token():
+    request = urllib.request.Request(
+        IMDS_BASE + "/latest/api/token",
+        method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        return response.read().decode()
+
+
+def imds_get(token, path, default=None):
+    request = urllib.request.Request(
+        IMDS_BASE + "/latest/meta-data/" + path,
+        headers={"X-aws-ec2-metadata-token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and default is not None:
+            return default
+        raise
+
+
+def discover_nics():
+    """Returns {device number: {"local": [private IPs], "public": [public IPs]}}."""
+    token = imds_token()
+    nics = {}
+    for mac in imds_get(token, "network/interfaces/macs/").split():
+        base = "network/interfaces/macs/%s/" % mac.strip("/")
+        device = int(imds_get(token, base + "device-number"))
+        nics[device] = {
+            "local": imds_get(token, base + "local-ipv4s").split(),
+            "public": imds_get(token, base + "public-ipv4s", default="").split(),
+        }
+    return nics
+
+
+# --- the check ---------------------------------------------------------------
+
+
+def probe_stun(ip, port, timeout=1.0):
+    """Returns None if (ip, port) answers a STUN Binding request, else a reason."""
+    txid = os.urandom(12)
+    request = struct.pack("!HHI", BINDING_REQUEST, 0, MAGIC_COOKIE) + txid
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(request, (ip, port))
+        data, source = sock.recvfrom(2048)
+    except socket.timeout:
+        return "no response"
+    except OSError as e:
+        return "socket error: %s" % e.strerror
+    finally:
+        sock.close()
+    if source != (ip, port):
+        return "answered from a different address or port"
+    if len(data) < 20:
+        return "response too short"
+    msg_type, msg_len, cookie = struct.unpack("!HHI", data[:8])
+    if msg_type != BINDING_SUCCESS or cookie != MAGIC_COOKIE or data[8:20] != txid:
+        return "not a matching Binding success response"
+    if 20 + msg_len > len(data):
+        return "truncated response"
+    offset, end = 20, 20 + msg_len
+    while offset + 4 <= end:
+        attr_type, attr_len = struct.unpack("!HH", data[offset:offset + 4])
+        if attr_type in (XOR_MAPPED_ADDRESS, MAPPED_ADDRESS):
+            return None
+        offset += 4 + attr_len + (-attr_len % 4)
+    return "response carries no mapped address"
+
+
+def check_once():
+    """Returns a list of problems; empty means healthy."""
+    try:
+        nics = discover_nics()
+    except Exception as e:  # metadata unreachable counts as unhealthy
+        return ["instance metadata unavailable: %s" % e]
+    problems = []
+    for device, name, expected in ((0, "primary", PRIMARY_EIP), (1, "alternate", ALT_EIP)):
+        nic = nics.get(device)
+        if nic is None or not nic["local"]:
+            problems.append("%s network interface missing" % name)
+            continue
+        if expected and expected not in nic["public"]:
+            problems.append("%s interface does not carry its Elastic IP" % name)
+        for port in STUN_PORTS:
+            reason = probe_stun(nic["local"][0], port)
+            if reason:
+                problems.append("%s interface, UDP %d: %s" % (name, port, reason))
+    return problems
+
+
+def report_unhealthy():
+    """Tells the Auto Scaling group this instance is unhealthy so it is replaced."""
+    token = imds_token()
+    instance_id = imds_get(token, "instance-id")
+    region = imds_get(token, "placement/region")
+    result = subprocess.run(
+        [AWS_BIN, "autoscaling", "set-instance-health", "--instance-id", instance_id,
+         "--health-status", "Unhealthy", "--no-should-respect-grace-period",
+         "--region", region],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, check=False,
+    )
+    log("reported Unhealthy to the Auto Scaling group (exit %d)" % result.returncode)
+
+
+class State:
+    def __init__(self):
+        self.healthy = False
+        self.checked_at = None  # monotonic time of the last finished check
+        self.failing_since = None
+        self.last_report = None
+        self.connections = 0
+
+    def answer(self):
+        fresh = self.checked_at is not None and time.monotonic() - self.checked_at < STALE_AFTER
+        return self.healthy and fresh
+
+
+async def checker(state):
+    loop = asyncio.get_running_loop()
+    previous = None
+    while True:
+        try:
+            problems = await asyncio.wait_for(loop.run_in_executor(None, check_once), 30)
+        except Exception as e:
+            problems = ["check did not finish: %r" % e]
+        now = time.monotonic()
+        state.healthy = not problems
+        state.checked_at = now
+        if problems:
+            state.failing_since = state.failing_since or now
+        else:
+            state.failing_since = None
+        # Log changes only, so a steady state does not fill the journal.
+        if problems != previous:
+            log("healthy" if not problems else "unhealthy: " + "; ".join(problems))
+            previous = problems
+        if (state.failing_since is not None
+                and now - state.failing_since >= UNHEALTHY_AFTER
+                and (state.last_report is None or now - state.last_report >= 60)):
+            state.last_report = now
+            try:
+                await loop.run_in_executor(None, report_unhealthy)
+            except Exception as e:
+                log("could not report Unhealthy: %r" % e)
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# --- the HTTP endpoint -------------------------------------------------------
+
+
+def http_response(ok):
+    status = RESPONSES[ok]
+    return (
+        b"HTTP/1.1 " + status + b"\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: " + str(len(status)).encode() + b"\r\n"
+        b"Cache-Control: no-store\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + status
+    )
+
+
+async def handle(reader, writer, state):
+    if state.connections >= MAX_CONNECTIONS:
+        writer.close()
+        return
+    state.connections += 1
+    try:
+        try:
+            # The request is read only so the client is done sending; its
+            # content is ignored. A silent or half-closed client is answered
+            # after at most two seconds all the same.
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+        except asyncio.LimitOverrunError:
+            return  # oversized: never answered, never drained, just dropped
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+            pass
+        writer.write(http_response(state.answer()))
+        await asyncio.wait_for(writer.drain(), 2)
+    except Exception:
+        pass
+    finally:
+        state.connections -= 1
+        writer.close()
+
+
+async def serve():
+    if not STATUS_BIND:
+        sys.exit("STATUS_BIND is required")
+    state = State()
+    server = await asyncio.start_server(
+        lambda r, w: handle(r, w, state), STATUS_BIND, STATUS_PORT, limit=4096, backlog=128,
+    )
+    log("status endpoint listening on %s:%d" % (STATUS_BIND, STATUS_PORT))
+    async with server:
+        await asyncio.gather(server.serve_forever(), checker(state))
+
+
+def main():
+    if "--check" in sys.argv[1:]:
+        problems = check_once()
+        print("healthy" if not problems else "unhealthy: " + "; ".join(problems))
+        return 0 if not problems else 1
+    asyncio.run(serve())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
