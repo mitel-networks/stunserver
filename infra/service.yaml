@@ -90,6 +90,75 @@ Resources:
       SubnetId: !Ref StunSubnet
       RouteTableId: !Ref StunRouteTable
 
+  # Looks up the ID of the AWS-managed prefix list of Route 53 health checker
+  # addresses in whichever region this stack is in, so the status port can be
+  # limited to them without a per-region table in this template. AWS keeps the
+  # list's contents current; only the ID is resolved here, and it never changes.
+  PrefixListLookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribePrefixLists
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Describe calls do not support resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: "*"
+
+  # Always answers CloudFormation, including on delete: a custom resource
+  # that stays silent would hold the stack operation for about an hour.
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt PrefixListLookupRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PrefixListLookupLogGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  name = event["ResourceProperties"]["Name"]
+                  lists = boto3.client("ec2").describe_managed_prefix_lists(Filters=[
+                      {"Name": "prefix-list-name", "Values": [name]},
+                      {"Name": "owner-id", "Values": ["AWS"]},
+                  ])["PrefixLists"]
+                  if len(lists) != 1:
+                      raise Exception("expected 1 prefix list named %s, found %d" % (name, len(lists)))
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Id": lists[0]["PrefixListId"]})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  HealthCheckPrefixList:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      Name: !Sub "com.amazonaws.${AWS::Region}.route53-healthchecks"
+
   StunSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -112,8 +181,8 @@ Resources:
         - IpProtocol: tcp
           FromPort: !Ref StatusPort
           ToPort: !Ref StatusPort
-          CidrIp: 0.0.0.0/0
-          Description: Status endpoint, health-checked by Route 53
+          SourcePrefixListId: !GetAtt HealthCheckPrefixList.Id
+          Description: Status endpoint, Route 53 health checkers only
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
